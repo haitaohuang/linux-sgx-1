@@ -101,6 +101,7 @@ static inline void sgx_free_va_slot(struct sgx_va_page *page,
 enum sgx_encl_page_flags {
 	SGX_ENCL_PAGE_TCS	= BIT(0),
 	SGX_ENCL_PAGE_RESERVED	= BIT(1),
+	SGX_ENCL_PAGE_TRIM	= BIT(2),
 };
 
 struct sgx_encl_page {

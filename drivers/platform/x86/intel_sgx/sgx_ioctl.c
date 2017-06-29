@@ -235,6 +235,153 @@ out:
 	return ret;
 }
 
+static void sgx_ipi_cb(void *info)
+{
+}
+
+static int sgx_emodpr(struct sgx_encl *encl, struct sgx_encl_page *page,
+		      struct sgx_secinfo *secinfo)
+{
+	void *ptr;
+	int ret;
+
+	ptr = sgx_get_page(page->epc_page);
+	ret = __emodpr(secinfo, ptr);
+	sgx_put_page(ptr);
+
+	if (ret) {
+		sgx_err(encl, "EMODPR returned %d\n", ret);
+		sgx_invalidate(encl, true);
+		smp_call_function(sgx_ipi_cb, NULL, 1);
+	}
+
+	return ret;
+}
+
+static int sgx_emodt(struct sgx_encl *encl, struct sgx_encl_page *page,
+		     struct sgx_secinfo *secinfo)
+{
+
+	u64 pt = secinfo->flags & SGX_SECINFO_PAGE_TYPE_MASK;
+	void *ptr;
+	int ret;
+
+	ptr = sgx_get_page(page->epc_page);
+	ret = __emodt(secinfo, ptr);
+	sgx_put_page(ptr);
+
+	if (ret) {
+		sgx_err(encl, "EMODT returned %d\n", ret);
+		sgx_invalidate(encl, true);
+		smp_call_function(sgx_ipi_cb, NULL, 1);
+	} else if (pt == SGX_SECINFO_TRIM) {
+		page->flags |= SGX_ENCL_PAGE_TRIM;
+	}
+
+	return ret;
+}
+
+typedef int (*sgx_encl_page_op_t)(struct sgx_encl *encl,
+				  struct sgx_encl_page *page,
+				  struct sgx_secinfo *secinfo);
+
+static int sgx_encl_mod_pages(struct sgx_encl *encl, unsigned long addr,
+			      unsigned long length, struct sgx_secinfo *secinfo,
+			      sgx_encl_page_op_t op)
+{
+	struct sgx_encl_page *page;
+	struct vm_area_struct *vma;
+	int ret;
+
+	/* Address and length must align to page boundaries. */
+	if ((addr & (PAGE_SIZE - 1)) || (length & (PAGE_SIZE - 1)) ||
+	    addr < encl->base || length > encl->size)
+		return -EINVAL;
+
+	ret = sgx_validate_secinfo(secinfo);
+	if (ret)
+		return ret;
+
+	down_read(&encl->mm->mmap_sem);
+	mutex_lock(&encl->lock);
+
+	if (encl->flags & SGX_ENCL_DEAD)
+		goto out;
+
+	for ( ; addr < (addr + length); addr += PAGE_SIZE) {
+		vma = sgx_find_vma(encl, addr);
+		if (!vma) {
+			ret = -EFAULT;
+			break;
+		}
+
+		page = sgx_fault_page(vma, addr, SGX_FAULT_RESERVE);
+		if (IS_ERR(page)) {
+			ret = PTR_ERR(page);
+			break;
+		}
+
+		sgx_eblock(encl, page->epc_page);
+		op(encl, page, secinfo);
+		sgx_etrack(encl);
+		smp_call_function(sgx_ipi_cb, NULL, 1);
+
+		page->flags &= ~SGX_ENCL_PAGE_RESERVED;
+	}
+
+out:
+	mutex_unlock(&encl->lock);
+	up_read(&encl->mm->mmap_sem);
+	return ret;
+}
+
+/**
+ * sgx_ioc_enclave_mod_pages - handler for SGX_IOC_ENCLAVE_MOD_PAGES
+ *
+ * @filep:	open file to /dev/sgx
+ * @cmd:	the command value
+ * @arg:	pointer to the struct sgx_enclave_mod_pages
+ *
+ * Changes type or permissions of a range of pages. This can be used in
+ * collaboration with a trusted loader in the enclave construction with a
+ * trusted run-time to trim unneeded pages. The trusted run-time must accept all
+ * the changes before they become active.
+ */
+static long sgx_ioc_enclave_mod_pages(struct file *filep, unsigned int cmd,
+				      unsigned long arg)
+{
+	struct sgx_enclave_mod_pages *params = (void *)arg;
+	sgx_encl_page_op_t op;
+	unsigned long secinfop = (unsigned long)params->secinfo;
+	struct sgx_secinfo secinfo;
+	struct sgx_encl *encl;
+	int ret;
+
+	switch (params->op) {
+	case SGX_ENCLAVE_MOD_TYPE:
+		op = sgx_emodt;
+		break;
+	case SGX_ENCLAVE_MOD_PROT:
+		op = sgx_emodpr;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (copy_from_user(&secinfo, (void __user *)secinfop, sizeof(secinfo)))
+		return -EFAULT;
+
+	ret = sgx_find_and_get_encl(params->addr, &encl);
+	if (ret)
+		return ret;
+
+	ret = sgx_encl_mod_pages(encl, params->addr, params->length, &secinfo,
+				 op);
+
+	kref_put(&encl->refcount, sgx_encl_release);
+	return ret;
+}
+
 typedef long (*sgx_ioc_t)(struct file *filep, unsigned int cmd,
 			  unsigned long arg);
 
@@ -253,6 +400,11 @@ long sgx_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 		break;
 	case SGX_IOC_ENCLAVE_INIT:
 		handler = sgx_ioc_enclave_init;
+		break;
+	case SGX_IOC_ENCLAVE_MOD_PAGES:
+		if (!sgx_has_sgx2)
+			return -ENOIOCTLCMD;
+		handler = sgx_ioc_enclave_mod_pages;
 		break;
 	default:
 		return -ENOIOCTLCMD;

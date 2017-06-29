@@ -132,6 +132,7 @@ enum sgx_secinfo_flags {
 	SGX_SECINFO_SECS	= 0x000ULL,
 	SGX_SECINFO_TCS		= 0x100ULL,
 	SGX_SECINFO_REG		= 0x200ULL,
+	SGX_SECINFO_TRIM        = 0x400ULL,
 };
 
 struct sgx_secinfo {
