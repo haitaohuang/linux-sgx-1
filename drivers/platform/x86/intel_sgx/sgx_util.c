@@ -269,7 +269,7 @@ static struct sgx_encl_page *sgx_do_fault(struct vm_area_struct *vma,
 
 	entry = radix_tree_lookup(&encl->page_tree, addr >> PAGE_SHIFT);
 	if (!entry) {
-		rc = -EFAULT;
+		rc = -ENOENT;
 		goto out;
 	}
 

@@ -382,6 +382,91 @@ static long sgx_ioc_enclave_mod_pages(struct file *filep, unsigned int cmd,
 	return ret;
 }
 
+/**
+ * sgx_ioc_enclave_remove_pages - handler for SGX_IOC_ENCLAVE_REMOVE_PAGES
+ *
+ * @filep:	open file to /dev/sgx
+ * @cmd:	the command value
+ * @arg:	pointer to the struct sgx_enclave_remove_pages
+ *
+ * Remove trimmed pages from an address range. Untrimmed and non-existing pages
+ * are skipped. If the pages have not been accepted (with EACCEPT) by the
+ * enclave, the function will stop iterating at that point and return -EFAULT to
+ * the caller.
+ */
+static long sgx_ioc_enclave_remove_pages(struct file *filep, unsigned int cmd,
+					 unsigned long arg)
+{
+	struct sgx_enclave_remove_pages *params = (void *)arg;
+	unsigned long addr = params->addr;
+	unsigned long length = params->length;
+	struct sgx_encl *encl;
+	struct sgx_encl_page *page;
+	struct vm_area_struct *vma;
+	int ret;
+
+	ret = sgx_find_and_get_encl(params->addr, &encl);
+	if (ret)
+		return ret;
+
+	/* Address and length must align to page boundaries. */
+	if ((addr & (PAGE_SIZE - 1)) || (length & (PAGE_SIZE - 1)) ||
+	    addr < encl->base || length > encl->size) {
+		kref_put(&encl->refcount, sgx_encl_release);
+		return -EINVAL;
+	}
+
+	down_read(&encl->mm->mmap_sem);
+
+	for ( ; addr < (addr + length); addr += PAGE_SIZE) {
+		vma = sgx_find_vma(encl, addr);
+		if (!vma) {
+			/* should never happen */
+			ret = -EFAULT;
+			break;
+		}
+
+		page = sgx_fault_page(vma, addr, SGX_FAULT_RESERVE);
+		if (IS_ERR(page)) {
+			ret = PTR_ERR(page);
+			if (ret == -ENOENT)
+				continue;
+
+			if (ret)
+				break;
+
+			if (page->flags & SGX_ENCL_PAGE_TRIM) {
+				page->flags &= ~SGX_ENCL_PAGE_RESERVED;
+				continue;
+			}
+		}
+
+		mutex_lock(&encl->lock);
+		zap_vma_ptes(vma, page->addr, PAGE_SIZE);
+		ret = sgx_free_page(page->epc_page, encl);
+		if (!ret) {
+			encl->secs_child_cnt--;
+			radix_tree_delete(&encl->page_tree,
+					  page->addr >> PAGE_SHIFT);
+			kfree(page);
+		}
+		mutex_unlock(&encl->lock);
+
+		page->flags &= ~SGX_ENCL_PAGE_RESERVED;
+
+		if (ret) {
+			sgx_dbg(encl, "%s: EREMOVE returned %d\n", __func__,
+				ret);
+			ret = -EFAULT;
+			break;
+		}
+	}
+
+	up_read(&encl->mm->mmap_sem);
+	kref_put(&encl->refcount, sgx_encl_release);
+	return ret;
+}
+
 typedef long (*sgx_ioc_t)(struct file *filep, unsigned int cmd,
 			  unsigned long arg);
 
@@ -405,6 +490,11 @@ long sgx_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 		if (!sgx_has_sgx2)
 			return -ENOIOCTLCMD;
 		handler = sgx_ioc_enclave_mod_pages;
+		break;
+	case SGX_IOC_ENCLAVE_REMOVE_PAGES:
+		handler = sgx_ioc_enclave_remove_pages;
+		if (!sgx_has_sgx2)
+			return -ENOIOCTLCMD;
 		break;
 	default:
 		return -ENOIOCTLCMD;
