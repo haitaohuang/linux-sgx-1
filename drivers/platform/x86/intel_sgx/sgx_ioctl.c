@@ -221,6 +221,9 @@ static long sgx_ioc_enclave_init(struct file *filep, unsigned int cmd,
 	if (ret)
 		goto out;
 
+	if (!(initp->flags && SGX_ENCLAVE_INIT_ARCH))
+		ret = sgx_le_get_token(&sgx_le_ctx, sigstruct, einittoken);
+
 	ret = sgx_find_and_get_encl(encl_id, &encl);
 	if (ret)
 		goto out;

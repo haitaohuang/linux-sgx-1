@@ -142,7 +142,7 @@ static unsigned long sgx_get_unmapped_area(struct file *file,
 	return addr;
 }
 
-static const struct file_operations sgx_fops = {
+const struct file_operations sgx_fops = {
 	.owner			= THIS_MODULE,
 	.unlocked_ioctl		= sgx_ioctl,
 #ifdef CONFIG_COMPAT
@@ -241,14 +241,20 @@ static int sgx_dev_init(struct device *dev)
 		goto out_iounmap;
 	}
 
+	ret = sgx_le_init(&sgx_le_ctx);
+	if (ret)
+		goto out_workqueue;
+
 	sgx_dev.parent = dev;
 	ret = misc_register(&sgx_dev);
 	if (ret) {
 		pr_err("intel_sgx: misc_register() failed\n");
-		goto out_workqueue;
+		goto out_le;
 	}
 
 	return 0;
+out_le:
+	sgx_le_exit(&sgx_le_ctx);
 out_workqueue:
 	destroy_workqueue(sgx_add_page_wq);
 out_iounmap:
@@ -315,6 +321,7 @@ static int sgx_drv_remove(struct platform_device *pdev)
 	int i;
 
 	misc_deregister(&sgx_dev);
+	sgx_le_exit(&sgx_le_ctx);
 	destroy_workqueue(sgx_add_page_wq);
 #ifdef CONFIG_X86_64
 	for (i = 0; i < sgx_nr_epc_banks; i++)
