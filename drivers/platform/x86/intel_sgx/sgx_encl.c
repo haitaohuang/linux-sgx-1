@@ -68,6 +68,7 @@
 #include <linux/slab.h>
 #include <linux/hashtable.h>
 #include <linux/shmem_fs.h>
+#include <linux/percpu.h>
 
 struct sgx_add_page_req {
 	struct sgx_encl *encl;
@@ -732,12 +733,47 @@ int sgx_encl_add_page(struct sgx_encl *encl, unsigned long addr, void *data,
 	return ret;
 }
 
+static void *sgx_set_pubkeyhash_msrs(void)
+{
+	u64 msrs_pubkeyhash[4];
+	bool *msrs_set;
+
+	msrs_set = get_cpu_var(sgx_msrs_set);
+	if (*msrs_set)
+		return msrs_set;
+
+	rdmsrl(MSR_IA32_SGXLEPUBKEYHASH0, msrs_pubkeyhash[0]);
+	rdmsrl(MSR_IA32_SGXLEPUBKEYHASH1, msrs_pubkeyhash[1]);
+	rdmsrl(MSR_IA32_SGXLEPUBKEYHASH2, msrs_pubkeyhash[2]);
+	rdmsrl(MSR_IA32_SGXLEPUBKEYHASH3, msrs_pubkeyhash[3]);
+
+	if ((sgx_le_pubkeyhash[0] == msrs_pubkeyhash[0]) &&
+	    (sgx_le_pubkeyhash[1] == msrs_pubkeyhash[1]) &&
+	    (sgx_le_pubkeyhash[2] == msrs_pubkeyhash[2]) &&
+	    (sgx_le_pubkeyhash[3] == msrs_pubkeyhash[3]))
+		return msrs_set;
+
+	if (sgx_locked_msrs) {
+		pr_err("intel_sgx: the LE public key MSRs do not match\n");
+		put_cpu_var(msrs_set);
+		return ERR_PTR(-ENODEV);
+	}
+
+	pr_info("intel_sgx: updating the LE public key MSRs\n");
+	wrmsrl(MSR_IA32_SGXLEPUBKEYHASH0, sgx_le_pubkeyhash[0]);
+	wrmsrl(MSR_IA32_SGXLEPUBKEYHASH1, sgx_le_pubkeyhash[1]);
+	wrmsrl(MSR_IA32_SGXLEPUBKEYHASH2, sgx_le_pubkeyhash[2]);
+	wrmsrl(MSR_IA32_SGXLEPUBKEYHASH3, sgx_le_pubkeyhash[3]);
+	return msrs_set;
+}
+
 int sgx_encl_init(struct sgx_encl *encl, struct sgx_sigstruct *sigstruct,
 		  struct sgx_einittoken *einittoken)
 {
 	int ret = SGX_UNMASKED_EVENT;
 	struct sgx_epc_page *secs_epc = encl->secs_page.epc_page;
 	void *secs_va = NULL;
+	void *cpu_lock;
 	int i;
 	int j;
 
@@ -752,9 +788,18 @@ int sgx_encl_init(struct sgx_encl *encl, struct sgx_sigstruct *sigstruct,
 
 	for (i = 0; i < SGX_EINIT_SLEEP_COUNT; i++) {
 		for (j = 0; j < SGX_EINIT_SPIN_COUNT; j++) {
+			cpu_lock = sgx_set_pubkeyhash_msrs();
+			if (IS_ERR(cpu_lock)) {
+				mutex_unlock(&encl->lock);
+				return PTR_ERR(cpu_lock);
+			}
+
 			secs_va = sgx_get_page(secs_epc);
 			ret = __einit(sigstruct, einittoken, secs_va);
 			sgx_put_page(secs_va);
+
+			put_cpu_var(cpu_lock);
+
 			if (ret == SGX_UNMASKED_EVENT)
 				continue;
 			else

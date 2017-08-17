@@ -164,6 +164,9 @@ extern u64 sgx_encl_size_max_64;
 extern u64 sgx_xfrm_mask;
 extern u32 sgx_ssaframesize_tbl[64];
 extern bool sgx_has_sgx2;
+extern bool sgx_locked_msrs;
+extern void *sgx_msrs_set;
+extern u64 sgx_le_pubkeyhash[4];
 
 extern const struct file_operations sgx_fops;
 extern const struct vm_operations_struct sgx_vm_ops;

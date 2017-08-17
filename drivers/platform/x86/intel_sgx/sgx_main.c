@@ -68,6 +68,7 @@
 #include <linux/hashtable.h>
 #include <linux/kthread.h>
 #include <linux/platform_device.h>
+#include <linux/percpu.h>
 
 #define DRV_DESCRIPTION "Intel SGX Driver"
 #define DRV_VERSION "0.10"
@@ -80,6 +81,7 @@ MODULE_VERSION(DRV_VERSION);
  * Global data.
  */
 
+extern struct sgx_sigstruct sgx_le_ss;
 struct workqueue_struct *sgx_add_page_wq;
 #define SGX_MAX_EPC_BANKS 8
 struct sgx_epc_bank sgx_epc_banks[SGX_MAX_EPC_BANKS];
@@ -89,6 +91,9 @@ u64 sgx_encl_size_max_64;
 u64 sgx_xfrm_mask = 0x3;
 u32 sgx_ssaframesize_tbl[64];
 bool sgx_has_sgx2;
+bool sgx_locked_msrs;
+void *sgx_msrs_set;
+u64 sgx_le_pubkeyhash[4];
 
 #ifdef CONFIG_COMPAT
 long sgx_compat_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
@@ -191,6 +196,14 @@ static int sgx_dev_init(struct device *dev)
 	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
 		return -ENODEV;
 
+	sgx_msrs_set = alloc_percpu(bool);
+	if (!sgx_msrs_set)
+		return -ENOMEM;
+
+	ret = sgx_get_key_hash_simple(sgx_le_ss.modulus, sgx_le_pubkeyhash);
+	if (ret)
+		return ret;
+
 	for (i = 0; i < SGX_MAX_EPC_BANKS; i++) {
 		cpuid_count(SGX_CPUID, i + 2, &eax, &ebx, &ecx, &edx);
 		if (!(eax & 0xf))
@@ -268,6 +281,7 @@ out_iounmap:
 static int sgx_drv_probe(struct platform_device *pdev)
 {
 	unsigned int eax, ebx, ecx, edx;
+	unsigned long fc;
 	int i;
 
 	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
@@ -282,6 +296,17 @@ static int sgx_drv_probe(struct platform_device *pdev)
 	if (!boot_cpu_has(X86_FEATURE_SGX)) {
 		pr_err("intel_sgx: the CPU is missing SGX\n");
 		return -ENODEV;
+	}
+
+	if (!boot_cpu_has(X86_FEATURE_SGX_LC)) {
+		pr_err("intel_sgx: the CPU is missing launch control\n");
+		return -ENODEV;
+	}
+
+	rdmsrl(MSR_IA32_FEATURE_CONTROL, fc);
+	if (!(fc & FEATURE_CONTROL_SGX_LAUNCH_CONTROL_ENABLE)) {
+		pr_info("intel_sgx: the LE public key MSRs are locked\n");
+		sgx_locked_msrs = true;
 	}
 
 	cpuid_count(SGX_CPUID, 0x0, &eax, &ebx, &ecx, &edx);
@@ -328,6 +353,7 @@ static int sgx_drv_remove(struct platform_device *pdev)
 		iounmap((void *)sgx_epc_banks[i].va);
 #endif
 	sgx_page_cache_teardown();
+	free_percpu(sgx_msrs_set);
 
 	return 0;
 }
